@@ -102,7 +102,7 @@ def find_route(req: RouteRequest):
     avoid_coords = []
     for route in scored_routes:
         for pt in route.get('risk_points', []):
-            if pt['score'] > 0.45:
+            if pt['score'] > 0.30:
                 avoid_coords.append((pt['lat'], pt['lon']))
 
     cautious = None
@@ -118,7 +118,7 @@ def find_route(req: RouteRequest):
         delta_lat = mid_lat - risk_center_lat
         delta_lon = mid_lon - risk_center_lon
         mag = max((delta_lat**2 + delta_lon**2)**0.5, 0.001)
-        push = 0.012
+        push = 0.035  # ~3.5km nudge
         wp_lat = mid_lat + (delta_lat / mag) * push
         wp_lon = mid_lon + (delta_lon / mag) * push
 
