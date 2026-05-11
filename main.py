@@ -113,18 +113,21 @@ def find_route(req: RouteRequest):
     fastest = dict(scored_routes[0])
     fastest['route_type'] = 'fastest'
 
-    # Safest = whichever of the alternatives has lowest risk score
-    safest = dict(min(scored_routes, key=lambda r: r['risk_score']))
-    safest['route_type'] = 'safest'
+    # Sort all routes by risk score, take top 3
+    safest_routes = sorted(scored_routes, key=lambda r: r['risk_score'])[:3]
+    for i, r in enumerate(safest_routes):
+        r['route_type'] = f'safest_{i+1}'
+        r['safest_rank'] = i + 1
 
     return {
         "fastest_route": fastest,
-        "safest_route":  safest,
+        "safest_route": safest_routes[0],        # backward compat
+        "safest_routes": safest_routes,           # new — all 3
         "comparison": {
-            "time_difference_min":    round(abs(fastest['duration_min'] - safest['duration_min']), 1),
-            "distance_difference_km": round(abs(fastest['distance_km']  - safest['distance_km']),  2),
-            "fastest_risk":           fastest['risk_label'],
-            "safest_risk":            safest['risk_label']
+            "time_difference_min": round(abs(fastest['duration_min'] - safest_routes[0]['duration_min']), 1),
+            "distance_difference_km": round(abs(fastest['distance_km'] - safest_routes[0]['distance_km']), 2),
+            "fastest_risk": fastest['risk_label'],
+            "safest_risk": safest_routes[0]['risk_label']
         }
     }
 
