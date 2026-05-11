@@ -18,7 +18,6 @@ engine = RiskEngine()
 print("All systems ready!")
 
 OSRM = "http://router.project-osrm.org/route/v1/driving"
-
 live_locations = {}
 
 class RouteRequest(BaseModel):
@@ -44,6 +43,57 @@ def get_stats():
 @app.get("/heatmap")
 def get_heatmap():
     return {"data": engine.get_heatmap()}
+
+def get_safe_waypoints(start_lat, start_lon, end_lat, end_lon, engine, n=2):
+    """
+    Find real low-risk waypoints from our accident data grid.
+    These are actual safe zones between start and end — not random nudges.
+    """
+    # Bounding box between start and end with padding
+    min_lat = min(start_lat, end_lat) - 0.02
+    max_lat = max(start_lat, end_lat) + 0.02
+    min_lon = min(start_lon, end_lon) - 0.02
+    max_lon = max(start_lon, end_lon) + 0.02
+
+    # Filter grid to area between start and end
+    region = engine.grid[
+        (engine.grid['lat_bin'] >= min_lat) &
+        (engine.grid['lat_bin'] <= max_lat) &
+        (engine.grid['lon_bin'] >= min_lon) &
+        (engine.grid['lon_bin'] <= max_lon)
+    ].copy()
+
+    if region.empty:
+        return []
+
+    # Get lowest risk zones in this region
+    safest_zones = region.nsmallest(50, 'risk_score')
+
+    if safest_zones.empty:
+        return []
+
+    # We want waypoints that are actually BETWEEN start and end
+    # Divide the journey into n+1 segments and pick best safe zone near each segment midpoint
+    waypoints = []
+    for i in range(1, n + 1):
+        # Target lat/lon at this fraction of journey
+        frac = i / (n + 1)
+        target_lat = start_lat + frac * (end_lat - start_lat)
+        target_lon = start_lon + frac * (end_lon - start_lon)
+
+        # Find lowest-risk zone closest to this target point
+        safest_zones = safest_zones.copy()
+        safest_zones['dist_to_target'] = (
+            (safest_zones['lat_bin'] - target_lat) ** 2 +
+            (safest_zones['lon_bin'] - target_lon) ** 2
+        )
+        # Weight by risk_score and distance — want low risk AND near target
+        safest_zones['score'] = safest_zones['risk_score'] + safest_zones['dist_to_target'] * 5
+
+        best = safest_zones.nsmallest(1, 'score').iloc[0]
+        waypoints.append((float(best['lat_bin']), float(best['lon_bin'])))
+
+    return waypoints
 
 @app.post("/route")
 def find_route(req: RouteRequest):
@@ -99,37 +149,25 @@ def find_route(req: RouteRequest):
     balanced['route_type'] = 'balanced'
     balanced['route_label'] = '🛡 Balanced'
 
-    avoid_coords = []
-    for route in scored_routes:
-        for pt in route.get('risk_points', []):
-            if pt['score'] > 0.30:
-                avoid_coords.append((pt['lat'], pt['lon']))
-
+    # Most Cautious: route through actual safe zones from our accident data
     cautious = None
-    if avoid_coords:
-        risk_lats = [c[0] for c in avoid_coords]
-        risk_lons = [c[1] for c in avoid_coords]
-        risk_center_lat = sum(risk_lats) / len(risk_lats)
-        risk_center_lon = sum(risk_lons) / len(risk_lons)
+    safe_waypoints = get_safe_waypoints(
+        req.start_lat, req.start_lon,
+        req.end_lat, req.end_lon,
+        engine, n=2
+    )
 
-        mid_lat = (req.start_lat + req.end_lat) / 2
-        mid_lon = (req.start_lon + req.end_lon) / 2
-
-        delta_lat = mid_lat - risk_center_lat
-        delta_lon = mid_lon - risk_center_lon
-        mag = max((delta_lat**2 + delta_lon**2)**0.5, 0.001)
-        push = 0.035  # ~3.5km nudge
-        wp_lat = mid_lat + (delta_lat / mag) * push
-        wp_lon = mid_lon + (delta_lon / mag) * push
-
+    if safe_waypoints:
+        # Build OSRM URL with safe zone waypoints in between
+        wp_str = ";".join([f"{lon},{lat}" for lat, lon in safe_waypoints])
         cautious_url = (
             f"{OSRM}/{req.start_lon},{req.start_lat};"
-            f"{wp_lon},{wp_lat};"
+            f"{wp_str};"
             f"{req.end_lon},{req.end_lat}"
             f"?overview=full&geometries=geojson&steps=true"
         )
         try:
-            cr = requests.get(cautious_url, timeout=10)
+            cr = requests.get(cautious_url, timeout=15)
             cd = cr.json()
             if cd.get('code') == 'Ok' and cd.get('routes'):
                 cr_route = cd['routes'][0]
@@ -175,10 +213,10 @@ def find_route(req: RouteRequest):
         "safest_route":  balanced,
         "safest_routes": safest_routes,
         "comparison": {
-            "time_difference_min":     round(abs(fastest['duration_min'] - balanced['duration_min']), 1),
-            "distance_difference_km":  round(abs(fastest['distance_km']  - balanced['distance_km']),  2),
-            "fastest_risk":            fastest['risk_label'],
-            "safest_risk":             balanced['risk_label']
+            "time_difference_min":    round(abs(fastest['duration_min'] - balanced['duration_min']), 1),
+            "distance_difference_km": round(abs(fastest['distance_km']  - balanced['distance_km']),  2),
+            "fastest_risk":           fastest['risk_label'],
+            "safest_risk":            balanced['risk_label']
         }
     }
 
