@@ -6,7 +6,6 @@ from risk_engine import RiskEngine
 
 app = FastAPI(title="SaferRoute AI")
 
-# This allows your React dashboard and React Native app to call this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,13 +17,9 @@ print("Starting SaferRoute AI...")
 engine = RiskEngine()
 print("All systems ready!")
 
-# OSRM = free routing API, uses same road graph logic as Google Maps
 OSRM = "http://router.project-osrm.org/route/v1/driving"
 
-# Stores live locations in memory (like WhatsApp live location)
 live_locations = {}
-
-# ── Request body shapes ────────────────────────────────────────────────────────
 
 class RouteRequest(BaseModel):
     start_lat: float
@@ -38,33 +33,20 @@ class LocationUpdate(BaseModel):
     lon:        float
     share_code: str
 
-# ── API endpoints ──────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"message": "SaferRoute AI is running ✅"}
 
-
 @app.get("/stats")
 def get_stats():
-    """Numbers shown in the dashboard top bar"""
     return engine.get_stats()
-
 
 @app.get("/heatmap")
 def get_heatmap():
-    """Risk dots shown on the map"""
     return {"data": engine.get_heatmap()}
-
 
 @app.post("/route")
 def find_route(req: RouteRequest):
-    """
-    Main endpoint — returns fastest route AND safest route.
-    OSRM uses real roads, real turns, real distances (like Google Maps).
-    We then score each route using our accident data.
-    """
-    # Call OSRM with alternatives=true to get multiple route options
     url = (
         f"{OSRM}/{req.start_lon},{req.start_lat};"
         f"{req.end_lon},{req.end_lat}"
@@ -80,13 +62,11 @@ def find_route(req: RouteRequest):
     if data.get('code') != 'Ok' or not data.get('routes'):
         raise HTTPException(status_code=404, detail="No route found between these points")
 
-    # Score each route OSRM returned (max 3)
     scored_routes = []
     for i, route in enumerate(data['routes'][:3]):
         coords = route['geometry']['coordinates']
         risk_score, risky_spots = engine.get_route_risk(coords)
 
-        # Get turn-by-turn directions from OSRM steps
         steps = []
         for leg in route.get('legs', []):
             for step in leg.get('steps', []):
@@ -109,39 +89,106 @@ def find_route(req: RouteRequest):
             "steps":       steps[:30]
         })
 
-    # Fastest = OSRM always returns shortest-time route first
     fastest = dict(scored_routes[0])
     fastest['route_type'] = 'fastest'
+    fastest['route_label'] = '⚡ Fastest'
 
-    # Sort all routes by risk score, take top 3
-    safest_routes = sorted(scored_routes, key=lambda r: r['risk_score'])[:3]
-    for i, r in enumerate(safest_routes):
-        r['route_type'] = f'safest_{i+1}'
-        r['safest_rank'] = i + 1
+    by_risk = sorted(scored_routes, key=lambda r: r['risk_score'])
+
+    balanced = dict(by_risk[0])
+    balanced['route_type'] = 'balanced'
+    balanced['route_label'] = '🛡 Balanced'
+
+    avoid_coords = []
+    for route in scored_routes:
+        for pt in route.get('risk_points', []):
+            if pt['score'] > 0.45:
+                avoid_coords.append((pt['lat'], pt['lon']))
+
+    cautious = None
+    if avoid_coords:
+        risk_lats = [c[0] for c in avoid_coords]
+        risk_lons = [c[1] for c in avoid_coords]
+        risk_center_lat = sum(risk_lats) / len(risk_lats)
+        risk_center_lon = sum(risk_lons) / len(risk_lons)
+
+        mid_lat = (req.start_lat + req.end_lat) / 2
+        mid_lon = (req.start_lon + req.end_lon) / 2
+
+        delta_lat = mid_lat - risk_center_lat
+        delta_lon = mid_lon - risk_center_lon
+        mag = max((delta_lat**2 + delta_lon**2)**0.5, 0.001)
+        push = 0.012
+        wp_lat = mid_lat + (delta_lat / mag) * push
+        wp_lon = mid_lon + (delta_lon / mag) * push
+
+        cautious_url = (
+            f"{OSRM}/{req.start_lon},{req.start_lat};"
+            f"{wp_lon},{wp_lat};"
+            f"{req.end_lon},{req.end_lat}"
+            f"?overview=full&geometries=geojson&steps=true"
+        )
+        try:
+            cr = requests.get(cautious_url, timeout=10)
+            cd = cr.json()
+            if cd.get('code') == 'Ok' and cd.get('routes'):
+                cr_route = cd['routes'][0]
+                cr_coords = cr_route['geometry']['coordinates']
+                cr_risk, cr_spots = engine.get_route_risk(cr_coords)
+                cr_steps = []
+                for leg in cr_route.get('legs', []):
+                    for step in leg.get('steps', []):
+                        m = step.get('maneuver', {})
+                        cr_steps.append({
+                            "name":       step.get('name', ''),
+                            "type":       m.get('type', ''),
+                            "modifier":   m.get('modifier', ''),
+                            "distance_m": round(step.get('distance', 0))
+                        })
+                cautious = {
+                    "route_id":    99,
+                    "coords":      cr_coords,
+                    "distance_km": round(cr_route['distance'] / 1000, 2),
+                    "duration_min":round(cr_route['duration'] / 60, 1),
+                    "risk_score":  cr_risk,
+                    "risk_label":  engine._score_to_level(cr_risk),
+                    "risk_points": cr_spots[:15],
+                    "steps":       cr_steps[:30],
+                    "route_type":  "cautious",
+                    "route_label": "🔒 Most Cautious"
+                }
+        except Exception:
+            pass
+
+    if not cautious:
+        if len(by_risk) > 1:
+            cautious = dict(by_risk[1])
+        else:
+            cautious = dict(balanced)
+        cautious['route_type'] = 'cautious'
+        cautious['route_label'] = '🔒 Most Cautious'
+
+    safest_routes = [balanced, cautious]
 
     return {
         "fastest_route": fastest,
-        "safest_route": safest_routes[0],        # backward compat
-        "safest_routes": safest_routes,           # new — all 3
+        "safest_route":  balanced,
+        "safest_routes": safest_routes,
         "comparison": {
-            "time_difference_min": round(abs(fastest['duration_min'] - safest_routes[0]['duration_min']), 1),
-            "distance_difference_km": round(abs(fastest['distance_km'] - safest_routes[0]['distance_km']), 2),
-            "fastest_risk": fastest['risk_label'],
-            "safest_risk": safest_routes[0]['risk_label']
+            "time_difference_min":     round(abs(fastest['duration_min'] - balanced['duration_min']), 1),
+            "distance_difference_km":  round(abs(fastest['distance_km']  - balanced['distance_km']),  2),
+            "fastest_risk":            fastest['risk_label'],
+            "safest_risk":             balanced['risk_label']
         }
     }
 
-
 @app.get("/point/{lat}/{lon}")
 def point_risk(lat: float, lon: float):
-    """Risk score for any single location"""
     score, reason, level = engine.get_point_risk(lat, lon)
     return {"lat": lat, "lon": lon, "score": score, "level": level, "reason": reason}
 
-
 @app.post("/location/share")
 def share_location(loc: LocationUpdate):
-    """Start sharing live location — like WhatsApp live location"""
     score, reason, level = engine.get_point_risk(loc.lat, loc.lon)
     live_locations[loc.share_code] = {
         "lat":    loc.lat,
@@ -151,14 +198,11 @@ def share_location(loc: LocationUpdate):
     }
     return {"status": "sharing", "code": loc.share_code}
 
-
 @app.get("/location/track/{code}")
 def track_location(code: str):
-    """Get someone's shared live location using their code"""
     if code not in live_locations:
         raise HTTPException(status_code=404, detail="Code not found or expired")
     return live_locations[code]
-
 
 @app.get("/track/{code}")
 def track_page(code: str):
@@ -194,10 +238,6 @@ def track_page(code: str):
     }},5000);
     </script></body></html>"""
     return HTMLResponse(html)
-
-
-
-
 
 if __name__ == "__main__":
     import uvicorn
