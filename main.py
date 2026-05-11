@@ -44,57 +44,6 @@ def get_stats():
 def get_heatmap():
     return {"data": engine.get_heatmap()}
 
-def get_safe_waypoints(start_lat, start_lon, end_lat, end_lon, engine, n=2):
-    """
-    Find real low-risk waypoints from our accident data grid.
-    These are actual safe zones between start and end — not random nudges.
-    """
-    # Bounding box between start and end with padding
-    min_lat = min(start_lat, end_lat) - 0.02
-    max_lat = max(start_lat, end_lat) + 0.02
-    min_lon = min(start_lon, end_lon) - 0.02
-    max_lon = max(start_lon, end_lon) + 0.02
-
-    # Filter grid to area between start and end
-    region = engine.grid[
-        (engine.grid['lat_bin'] >= min_lat) &
-        (engine.grid['lat_bin'] <= max_lat) &
-        (engine.grid['lon_bin'] >= min_lon) &
-        (engine.grid['lon_bin'] <= max_lon)
-    ].copy()
-
-    if region.empty:
-        return []
-
-    # Get lowest risk zones in this region
-    safest_zones = region.nsmallest(50, 'risk_score')
-
-    if safest_zones.empty:
-        return []
-
-    # We want waypoints that are actually BETWEEN start and end
-    # Divide the journey into n+1 segments and pick best safe zone near each segment midpoint
-    waypoints = []
-    for i in range(1, n + 1):
-        # Target lat/lon at this fraction of journey
-        frac = i / (n + 1)
-        target_lat = start_lat + frac * (end_lat - start_lat)
-        target_lon = start_lon + frac * (end_lon - start_lon)
-
-        # Find lowest-risk zone closest to this target point
-        safest_zones = safest_zones.copy()
-        safest_zones['dist_to_target'] = (
-            (safest_zones['lat_bin'] - target_lat) ** 2 +
-            (safest_zones['lon_bin'] - target_lon) ** 2
-        )
-        # Weight by risk_score and distance — want low risk AND near target
-        safest_zones['score'] = safest_zones['risk_score'] + safest_zones['dist_to_target'] * 5
-
-        best = safest_zones.nsmallest(1, 'score').iloc[0]
-        waypoints.append((float(best['lat_bin']), float(best['lon_bin'])))
-
-    return waypoints
-
 @app.post("/route")
 def find_route(req: RouteRequest):
     url = (
@@ -149,20 +98,47 @@ def find_route(req: RouteRequest):
     balanced['route_type'] = 'balanced'
     balanced['route_label'] = '🛡 Balanced'
 
-    # Most Cautious: route through actual safe zones from our accident data
+    # Most Cautious: perpendicular detour away from high-risk cluster
     cautious = None
-    safe_waypoints = get_safe_waypoints(
-        req.start_lat, req.start_lon,
-        req.end_lat, req.end_lon,
-        engine, n=2
-    )
 
-    if safe_waypoints:
-        # Build OSRM URL with safe zone waypoints in between
-        wp_str = ";".join([f"{lon},{lat}" for lat, lon in safe_waypoints])
+    all_risky = []
+    for route in scored_routes:
+        for pt in route.get('risk_points', []):
+            all_risky.append((pt['lat'], pt['lon'], pt['score']))
+
+    if all_risky:
+        top_risky = sorted(all_risky, key=lambda x: -x[2])[:10]
+        risk_center_lat = sum(p[0] for p in top_risky) / len(top_risky)
+        risk_center_lon = sum(p[1] for p in top_risky) / len(top_risky)
+
+        route_vec_lat = req.end_lat - req.start_lat
+        route_vec_lon = req.end_lon - req.start_lon
+
+        # Perpendicular direction
+        perp_lat = -route_vec_lon
+        perp_lon = route_vec_lat
+        perp_mag = max((perp_lat**2 + perp_lon**2)**0.5, 0.001)
+        perp_lat /= perp_mag
+        perp_lon /= perp_mag
+
+        mid_lat = (req.start_lat + req.end_lat) / 2
+        mid_lon = (req.start_lon + req.end_lon) / 2
+
+        # Which side is the risk center on?
+        risk_side = (risk_center_lat - mid_lat) * perp_lat + (risk_center_lon - mid_lon) * perp_lon
+        # Push to OPPOSITE side
+        direction = -1 if risk_side > 0 else 1
+
+        push = 0.025  # ~2.5km perpendicular offset
+        wp1_lat = req.start_lat + 0.33 * route_vec_lat + direction * push * perp_lat
+        wp1_lon = req.start_lon + 0.33 * route_vec_lon + direction * push * perp_lon
+        wp2_lat = req.start_lat + 0.66 * route_vec_lat + direction * push * perp_lat
+        wp2_lon = req.start_lon + 0.66 * route_vec_lon + direction * push * perp_lon
+
         cautious_url = (
             f"{OSRM}/{req.start_lon},{req.start_lat};"
-            f"{wp_str};"
+            f"{wp1_lon},{wp1_lat};"
+            f"{wp2_lon},{wp2_lat};"
             f"{req.end_lon},{req.end_lat}"
             f"?overview=full&geometries=geojson&steps=true"
         )
