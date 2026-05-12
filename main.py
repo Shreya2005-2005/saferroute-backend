@@ -97,7 +97,7 @@ def find_route(req: RouteRequest):
     by_risk = sorted(scored_routes, key=lambda r: r['risk_score'])
     balanced = dict(by_risk[0])
     balanced['route_type'] = 'balanced'
-    balanced['route_label'] = '🛡 Balanced'
+    balanced['route_label'] = '🛡 Safest Route #1'
 
     # Most Cautious = try 4 combinations of direction + push distance
     # pick whichever gives lowest risk score
@@ -187,7 +187,7 @@ def find_route(req: RouteRequest):
         else:
             cautious = dict(balanced)
         cautious['route_type'] = 'cautious'
-        cautious['route_label'] = '🔒 Most Cautious'
+        cautious['route_label'] = '🛡 Safest Route #2'
 
     safest_routes = [balanced, cautious]
 
