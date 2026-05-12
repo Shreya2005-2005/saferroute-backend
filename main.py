@@ -128,8 +128,9 @@ def find_route(req: RouteRequest):
         risk_side = (risk_center_lat - mid_lat) * perp_lat + (risk_center_lon - mid_lon) * perp_lon
         # Push to OPPOSITE side
         direction = -1 if risk_side > 0 else 1
+        alt_direction = -direction  # try opposite side too
 
-        push = 0.025  # ~2.5km perpendicular offset
+        push = 0.06  # ~2.5km perpendicular offset
         wp1_lat = req.start_lat + 0.33 * route_vec_lat + direction * push * perp_lat
         wp1_lon = req.start_lon + 0.33 * route_vec_lon + direction * push * perp_lon
         wp2_lat = req.start_lat + 0.66 * route_vec_lat + direction * push * perp_lat
