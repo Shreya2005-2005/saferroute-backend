@@ -46,7 +46,9 @@ class RiskEngine:
         scores = []
         risky_spots = []
 
-        for point in coords[::5]:   # check every 5th point
+        # Sample max 100 points evenly regardless of route length
+        step = max(1, len(coords) // 100)
+        for point in coords[::step]:
             lon, lat = point[0], point[1]
             score, reason, level = self.get_point_risk(lat, lon)
             scores.append(score)
