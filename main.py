@@ -173,7 +173,7 @@ def find_route(req: RouteRequest):
                                 "risk_points": cr_spots[:15],
                                 "steps":       cr_steps[:30],
                                 "route_type":  "cautious",
-                                "route_label": "🔒 Most Cautious"
+                                "route_label": "🛡 Safest Route #2"
                             }
                 except Exception:
                     pass
