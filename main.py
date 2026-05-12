@@ -88,17 +88,19 @@ def find_route(req: RouteRequest):
             "steps":       steps[:30]
         })
 
+    # Fastest = OSRM first result (shortest time)
     fastest = dict(scored_routes[0])
     fastest['route_type'] = 'fastest'
     fastest['route_label'] = '⚡ Fastest'
 
+    # Balanced = lowest risk from OSRM alternatives
     by_risk = sorted(scored_routes, key=lambda r: r['risk_score'])
-
     balanced = dict(by_risk[0])
     balanced['route_type'] = 'balanced'
     balanced['route_label'] = '🛡 Balanced'
 
-    # Most Cautious: perpendicular detour away from high-risk cluster
+    # Most Cautious = try 4 combinations of direction + push distance
+    # pick whichever gives lowest risk score
     cautious = None
 
     all_risky = []
@@ -124,57 +126,61 @@ def find_route(req: RouteRequest):
         mid_lat = (req.start_lat + req.end_lat) / 2
         mid_lon = (req.start_lon + req.end_lon) / 2
 
-        # Which side is the risk center on?
         risk_side = (risk_center_lat - mid_lat) * perp_lat + (risk_center_lon - mid_lon) * perp_lon
-        # Push to OPPOSITE side
-        direction = -1 if risk_side > 0 else 1
-        alt_direction = -direction  # try opposite side too
+        primary_direction = -1 if risk_side > 0 else 1
 
-        push = 0.06  # ~2.5km perpendicular offset
-        wp1_lat = req.start_lat + 0.33 * route_vec_lat + direction * push * perp_lat
-        wp1_lon = req.start_lon + 0.33 * route_vec_lon + direction * push * perp_lon
-        wp2_lat = req.start_lat + 0.66 * route_vec_lat + direction * push * perp_lat
-        wp2_lon = req.start_lon + 0.66 * route_vec_lon + direction * push * perp_lon
+        best_cautious = None
 
-        cautious_url = (
-            f"{OSRM}/{req.start_lon},{req.start_lat};"
-            f"{wp1_lon},{wp1_lat};"
-            f"{wp2_lon},{wp2_lat};"
-            f"{req.end_lon},{req.end_lat}"
-            f"?overview=full&geometries=geojson&steps=true"
-        )
-        try:
-            cr = requests.get(cautious_url, timeout=15)
-            cd = cr.json()
-            if cd.get('code') == 'Ok' and cd.get('routes'):
-                cr_route = cd['routes'][0]
-                cr_coords = cr_route['geometry']['coordinates']
-                cr_risk, cr_spots = engine.get_route_risk(cr_coords)
-                cr_steps = []
-                for leg in cr_route.get('legs', []):
-                    for step in leg.get('steps', []):
-                        m = step.get('maneuver', {})
-                        cr_steps.append({
-                            "name":       step.get('name', ''),
-                            "type":       m.get('type', ''),
-                            "modifier":   m.get('modifier', ''),
-                            "distance_m": round(step.get('distance', 0))
-                        })
-                cautious = {
-                    "route_id":    99,
-                    "coords":      cr_coords,
-                    "distance_km": round(cr_route['distance'] / 1000, 2),
-                    "duration_min":round(cr_route['duration'] / 60, 1),
-                    "risk_score":  cr_risk,
-                    "risk_label":  engine._score_to_level(cr_risk),
-                    "risk_points": cr_spots[:15],
-                    "steps":       cr_steps[:30],
-                    "route_type":  "cautious",
-                    "route_label": "🔒 Most Cautious"
-                }
-        except Exception:
-            pass
+        for direction in [primary_direction, -primary_direction]:
+            for push in [0.04, 0.06]:
+                wp1_lat = req.start_lat + 0.33 * route_vec_lat + direction * push * perp_lat
+                wp1_lon = req.start_lon + 0.33 * route_vec_lon + direction * push * perp_lon
+                wp2_lat = req.start_lat + 0.66 * route_vec_lat + direction * push * perp_lat
+                wp2_lon = req.start_lon + 0.66 * route_vec_lon + direction * push * perp_lon
 
+                cautious_url = (
+                    f"{OSRM}/{req.start_lon},{req.start_lat};"
+                    f"{wp1_lon},{wp1_lat};"
+                    f"{wp2_lon},{wp2_lat};"
+                    f"{req.end_lon},{req.end_lat}"
+                    f"?overview=full&geometries=geojson&steps=true"
+                )
+                try:
+                    cr = requests.get(cautious_url, timeout=15)
+                    cd = cr.json()
+                    if cd.get('code') == 'Ok' and cd.get('routes'):
+                        cr_route = cd['routes'][0]
+                        cr_coords = cr_route['geometry']['coordinates']
+                        cr_risk, cr_spots = engine.get_route_risk(cr_coords)
+                        if best_cautious is None or cr_risk < best_cautious['risk_score']:
+                            cr_steps = []
+                            for leg in cr_route.get('legs', []):
+                                for step in leg.get('steps', []):
+                                    m = step.get('maneuver', {})
+                                    cr_steps.append({
+                                        "name":       step.get('name', ''),
+                                        "type":       m.get('type', ''),
+                                        "modifier":   m.get('modifier', ''),
+                                        "distance_m": round(step.get('distance', 0))
+                                    })
+                            best_cautious = {
+                                "route_id":    99,
+                                "coords":      cr_coords,
+                                "distance_km": round(cr_route['distance'] / 1000, 2),
+                                "duration_min":round(cr_route['duration'] / 60, 1),
+                                "risk_score":  cr_risk,
+                                "risk_label":  engine._score_to_level(cr_risk),
+                                "risk_points": cr_spots[:15],
+                                "steps":       cr_steps[:30],
+                                "route_type":  "cautious",
+                                "route_label": "🔒 Most Cautious"
+                            }
+                except Exception:
+                    pass
+
+        cautious = best_cautious
+
+    # Fallback if no cautious route found
     if not cautious:
         if len(by_risk) > 1:
             cautious = dict(by_risk[1])
